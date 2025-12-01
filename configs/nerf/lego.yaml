@@ -1,5 +1,5 @@
 task: "nerf_replication"
-gpus: [1] # set gpu device number
+gpus: [0] # set gpu device number
 exp_name: "nerf"
 scene: "lego"
 
@@ -52,8 +52,8 @@ train_dataset:
 test_dataset:
   data_root: "data/nerf_synthetic"
   split: "test"
-  input_ratio: 0.5
-  cams: [0, -1, 100]
+  input_ratio: 0.1
+  cams: [-1]
   H: 800
   W: 800
 
@@ -68,7 +68,7 @@ train:
     type: "exponential"
     gamma: 0.1
     decay_epochs: 500 # original 1000
-  num_workers: 4
+  num_workers: 0
 
 test:
   batch_size: 1
