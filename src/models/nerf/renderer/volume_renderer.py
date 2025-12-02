@@ -11,6 +11,7 @@ class Renderer:
         self.perturb = cfg.task_arg.perturb
         self.raw_noise_std = cfg.task_arg.raw_noise_std
         self.lindisp = cfg.task_arg.lindisp
+        self.chunk_size = getattr(cfg.task_arg, 'chunk_size', 4096)
         
         self.near = 2.0
         self.far = 6.0
@@ -106,60 +107,86 @@ class Renderer:
 
     def render(self, batch):
         rays = batch['rays']
+        original_shape = rays.shape
         if rays.dim() != 2:
             rays = rays.reshape(-1, rays.shape[-1])
-        
+
         # Split rays into origins and directions
-        rays_o, rays_d = rays[..., :3], rays[..., 3:6]  # (N_rays, 3)
-        
+        rays_o_all, rays_d_all = rays[..., :3], rays[..., 3:6]  # (N_rays, 3)
+
         device = next(self.net.parameters()).device
-        rays_o = rays_o.to(device)
-        rays_d = rays_d.to(device)
-        
-        # Normalize ray directions
-        viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
-        viewdirs = torch.flatten(viewdirs, 0, -2) if viewdirs.dim() > 2 else viewdirs
-        
-        # ========== Coarse Network ========== 
-        pts_coarse, z_vals_coarse = self.sample_pts_along_ray(
-            rays_o, rays_d, self.near, self.far, self.N_samples, 
-            perturb=self.perturb > 0, lindisp=self.lindisp
-        )
+        rays_o_all = rays_o_all.to(device)
+        rays_d_all = rays_d_all.to(device)
 
-        raw_coarse = self.net.forward(pts_coarse, viewdirs, model='coarse')
+        N_total = rays_o_all.shape[0]
 
-        rgb_coarse, disp_coarse, acc_coarse, weights_coarse, depth_coarse = self.raw2outputs(
-            raw_coarse, z_vals_coarse, rays_d, self.raw_noise_std
-        )
+        # Storage for chunked outputs
+        rgb_coarse_all, disp_coarse_all, acc_coarse_all, depth_coarse_all = [], [], [], []
+        rgb_fine_all, disp_fine_all, acc_fine_all, depth_fine_all = [], [], [], []
 
+        # Process rays in chunks to avoid OOM
+        for i in range(0, N_total, self.chunk_size):
+            rays_o = rays_o_all[i : i + self.chunk_size]
+            rays_d = rays_d_all[i : i + self.chunk_size]
+
+            # Normalize ray directions
+            viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+            viewdirs = torch.flatten(viewdirs, 0, -2) if viewdirs.dim() > 2 else viewdirs
+
+            # Coarse sampling
+            pts_coarse, z_vals_coarse = self.sample_pts_along_ray(
+                rays_o, rays_d, self.near, self.far, self.N_samples,
+                perturb=self.perturb > 0, lindisp=self.lindisp
+            )
+
+            raw_coarse = self.net.forward(pts_coarse, viewdirs, model='coarse')
+
+            rgb_c, disp_c, acc_c, weights_coarse, depth_c = self.raw2outputs(
+                raw_coarse, z_vals_coarse, rays_d, self.raw_noise_std
+            )
+
+            rgb_coarse_all.append(rgb_c)
+            disp_coarse_all.append(disp_c)
+            acc_coarse_all.append(acc_c)
+            depth_coarse_all.append(depth_c)
+
+            # Fine sampling
+            if self.N_importance > 0:
+                z_vals_mid = 0.5 * (z_vals_coarse[..., 1:] + z_vals_coarse[..., :-1])
+                z_samples = self.sample_pdf(
+                    z_vals_mid, weights_coarse[..., 1:-1], self.N_importance,
+                    det=(self.perturb == 0)
+                )
+                z_samples = z_samples.detach()
+
+                z_vals_fine, _ = torch.sort(torch.cat([z_vals_coarse, z_samples], -1), -1)
+                pts_fine = rays_o[..., None, :] + rays_d[..., None, :] * z_vals_fine[..., :, None]
+
+                raw_fine = self.net.forward(pts_fine, viewdirs, model='fine')
+
+                rgb_f, disp_f, acc_f, _, depth_f = self.raw2outputs(
+                    raw_fine, z_vals_fine, rays_d, self.raw_noise_std
+                )
+
+                rgb_fine_all.append(rgb_f)
+                disp_fine_all.append(disp_f)
+                acc_fine_all.append(acc_f)
+                depth_fine_all.append(depth_f)
+
+        # Concatenate chunked outputs
         ret = {
-            'rgb_coarse': rgb_coarse,
-            'disp_coarse': disp_coarse,
-            'acc_coarse': acc_coarse,
-            'depth_coarse': depth_coarse,
+            'rgb_coarse': torch.cat(rgb_coarse_all, dim=0),
+            'disp_coarse': torch.cat(disp_coarse_all, dim=0),
+            'acc_coarse': torch.cat(acc_coarse_all, dim=0),
+            'depth_coarse': torch.cat(depth_coarse_all, dim=0),
         }
 
-        # ========== Fine Network ========== 
-        if self.N_importance > 0:
-            z_vals_mid = 0.5 * (z_vals_coarse[..., 1:] + z_vals_coarse[..., :-1])
-            z_samples = self.sample_pdf(
-                z_vals_mid, weights_coarse[..., 1:-1], self.N_importance, 
-                det=(self.perturb == 0)
-            )
-            z_samples = z_samples.detach()
-
-            z_vals_fine, _ = torch.sort(torch.cat([z_vals_coarse, z_samples], -1), -1)
-            pts_fine = rays_o[..., None, :] + rays_d[..., None, :] * z_vals_fine[..., :, None]
-
-            raw_fine = self.net.forward(pts_fine, viewdirs, model='fine')
-
-            rgb_fine, disp_fine, acc_fine, weights_fine, depth_fine = self.raw2outputs(
-                raw_fine, z_vals_fine, rays_d, self.raw_noise_std
-            )
-
-            ret['rgb_fine'] = rgb_fine
-            ret['disp_fine'] = disp_fine
-            ret['acc_fine'] = acc_fine
-            ret['depth_fine'] = depth_fine
+        if self.N_importance > 0 and len(rgb_fine_all) > 0:
+            ret.update({
+                'rgb_fine': torch.cat(rgb_fine_all, dim=0),
+                'disp_fine': torch.cat(disp_fine_all, dim=0),
+                'acc_fine': torch.cat(acc_fine_all, dim=0),
+                'depth_fine': torch.cat(depth_fine_all, dim=0),
+            })
 
         return ret
